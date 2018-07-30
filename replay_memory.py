@@ -22,10 +22,14 @@ class ReplayMemory(object):
     def push(self, state, action, reward, policy, is_done):
         self.buffer[self.index].append(Transition(state, action, reward, policy, is_done))
         if is_done:
-            self.buffer.append(deque(maxlen=self.max_epi_length))
-            self.index = min(self.index + 1, self.buffer.maxlen - 1)
+            if len(self.buffer[self.index]) < 5:
+                self.buffer.pop()
+                self.buffer.append(deque(maxlen=self.max_epi_length))
+            else:
+                self.buffer.append(deque(maxlen=self.max_epi_length))
+                self.index = min(self.index + 1, self.buffer.maxlen - 1)
 
-    def sample(self, batch_size=10):
+    def sample(self, batch_size):
         # check if the last item in buffer is empty
         if self.buffer[len(self.buffer) - 1]:
             length = len(self.buffer)
