@@ -3,7 +3,6 @@ import numpy as np
 import gym
 from replay_memory import ReplayMemory
 
-global_iter = 0
 ep_num = 0
 ep_rewards = []
 
@@ -23,8 +22,8 @@ class ActorCriticNet(object):
             self.a_his = tf.placeholder(tf.int32, [None, ], 'history_actions')
             self.rho = tf.placeholder(tf.float32, [None, ], 'importance_sampling')
             self.average_p = tf.placeholder(tf.float32, [None, self.output_size], 'average_policy')
-            self.optimizer_a = tf.train.RMSPropOptimizer(args.learning_rate, decay=0.99, name='Optimizer_Actor')
-            self.optimizer_c = tf.train.RMSPropOptimizer(args.learning_rate, decay=0.99, name='Optimizer_Critic')
+            self.optimizer_a = tf.train.AdamOptimizer(args.learning_rate, name='Optimizer_Actor')
+            self.optimizer_c = tf.train.AdamOptimizer(args.learning_rate, name='Optimizer_Critic')
 
     def _build_net(self, args):
         with tf.variable_scope('actor'):
@@ -90,14 +89,13 @@ class Agent(ActorCriticNet):
             a_gradients_raw = tf.gradients(self.a_loss, self.a_params)
             kl_gradients = tf.gradients(self.kl_loss, self.a_params)
             # Compute dot products of gradients
-            k_dot_g = [tf.reduce_sum(k_g * a_g) for k_g, a_g in zip(kl_gradients, a_gradients_raw)]
-            k_dot_k = [tf.reduce_sum(k_g ** 2) for k_g in kl_gradients]
+            k_dot_g = sum([tf.reduce_sum(k_g * a_g) for k_g, a_g in zip(kl_gradients, a_gradients_raw)])
+            k_dot_k = sum([tf.reduce_sum(k_g ** 2) for k_g in kl_gradients])
             # Compute trust region update
-            trust_factor = [tf.maximum(0.0, (kg - 1) / kk) for kg, kk in zip(k_dot_g, k_dot_k)]
-            self.a_gradients = [g_p - t_f * k_p for g_p, k_p, t_f in zip(a_gradients_raw, kl_gradients, trust_factor)]
-            # self.a_gradients = [tf.clip_by_norm(gradient, args.max_gradient_norm) for gradient in a_gradients_raw]
+            trust_factor = tf.where(tf.equal(k_dot_k, tf.zeros_like(k_dot_k)), 0.0,
+                                    tf.maximum(0.0, (k_dot_g - args.delta) / k_dot_k))
+            self.a_gradients = [g_p - trust_factor * k_p for g_p, k_p in zip(a_gradients_raw, kl_gradients)]
             self.c_gradients = tf.gradients(self.c_loss, self.c_params)
-            # self.c_gradients = [tf.clip_by_norm(gradient, args.max_gradient_norm) for gradient in self.c_gradients]
         with tf.name_scope('pull'):
             self.pull_a_params_op = [tf.assign(l_p, g_p) for l_p, g_p in zip(self.a_params, global_net.a_params)]
             self.pull_c_params_op = [tf.assign(l_p, g_p) for l_p, g_p in zip(self.c_params, global_net.c_params)]
@@ -122,18 +120,16 @@ class Agent(ActorCriticNet):
     def update_average(self):
         self.sess.run(self.update_average_net_op)
 
-    def acer_main(self, coord, global_net, average_net: ActorCriticNet):
-        global global_iter
-        while not coord.should_stop() and global_iter < self.args.max_iterations:
+    def acer_main(self, counter, coord, average_net: ActorCriticNet):
+        while not coord.should_stop() and counter.value() < self.args.max_training_steps:
             self.pull_global()
-            self._train(average_net, global_net, on_policy=True)
+            self._train(counter, average_net, on_policy=True)
             if len(self.memory) >= self.args.replay_start:
                 n = np.random.poisson(self.args.replay_ratio)
                 for i in range(n):
-                    self._train(average_net, global_net, on_policy=False)
-            global_iter += 1
+                    self._train(counter, average_net, on_policy=False)
 
-    def _train(self, average_net: ActorCriticNet, global_net, on_policy: bool):
+    def _train(self, counter, average_net: ActorCriticNet, on_policy: bool):
         global ep_num
         t = 1
         # call on policy part, generate episode and save to replay memory
@@ -149,7 +145,7 @@ class Agent(ActorCriticNet):
                 self.memory.push(state, action, reward, policy, is_done)
                 [b.append(item) for b, item in zip((buffer_s, buffer_a, buffer_r),
                                                    (state, action, reward))]
-                if t % self.args.t_max == 0 or is_done:
+                if t == self.args.t_max or is_done:
                     if is_done:
                         q_ret = 0
                     else:
@@ -160,10 +156,11 @@ class Agent(ActorCriticNet):
 
                 # Increment counters
                 t += 1
+                counter.increment()
                 state = next_state
                 if is_done:
                     ep_num += 1
-                    print('Thread:', self.name, 'Episode:', ep_num, 'Reward:', total_reward)
+                    # print('Thread:', self.name, 'Episode:', ep_num, 'Reward:', total_reward)
                     break
         else:
             samples = self.memory.sample(self.args.batch_size)
